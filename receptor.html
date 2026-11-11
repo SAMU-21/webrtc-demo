@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Receptor - Compartir Pantalla (PoC WebRTC)</title>
+<style>
+  /* ============ ZONA DE INTERFAZ (editable) ============ */
+  body {
+    font-family: system-ui, Arial, sans-serif;
+    background: #0f172a;
+    color: #f1f5f9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    margin-bottom: 4px;
+  }
+  #status {
+    color: #94a3b8;
+    font-size: 0.9rem;
+    margin-bottom: 18px;
+    min-height: 1.3em;
+  }
+  #status.ok { color: #4ade80; }
+  #status.err { color: #f87171; }
+  video {
+    width: 100%;
+    max-width: 960px;
+    background: #000;
+    border-radius: 10px;
+    border: 1px solid #334155;
+  }
+  .placeholder {
+    width: 100%;
+    max-width: 960px;
+    aspect-ratio: 16/9;
+    background: #1e293b;
+    border-radius: 10px;
+    border: 1px dashed #475569;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #64748b;
+    font-size: 0.95rem;
+  }
+  .badge {
+    margin-top: 16px;
+    font-size: 0.75rem;
+    color: #64748b;
+  }
+  /* ============ FIN ZONA DE INTERFAZ ============ */
+</style>
+</head>
+<body>
+
+  <h1>🖥️ Receptor de pantalla remota</h1>
+  <div id="status">Conectando al servidor de señalización...</div>
+
+  <video id="remoteVideo" autoplay playsinline style="display:none;"></video>
+  <div id="placeholder" class="placeholder">Esperando transmisión del emisor...</div>
+
+  <div class="badge">PoC académica — Receptor</div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // ============ LÓGICA WEBRTC / SEÑALIZACIÓN ============
+
+    const statusEl = document.getElementById("status");
+    const videoEl = document.getElementById("remoteVideo");
+    const placeholderEl = document.getElementById("placeholder");
+
+    const socket = io();
+
+    let peerConnection = null;
+
+    const ICE_CONFIG = {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+    };
+
+    function setStatus(msg, type) {
+      statusEl.textContent = msg;
+      statusEl.className = type || "";
+    }
+
+    socket.on("connect", () => {
+      socket.emit("join", "receptor");
+      setStatus("Conectado. Esperando que el emisor inicie la compartición...");
+    });
+
+    socket.on("connect_error", () => {
+      setStatus("No se pudo conectar al servidor de señalización.", "err");
+    });
+
+    socket.on("webrtc-offer", async ({ sdp }) => {
+      setStatus("Oferta recibida del emisor. Negociando conexión...");
+      crearPeerConnection();
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      socket.emit("webrtc-answer", { sdp: answer });
+    });
+
+    socket.on("webrtc-ice-candidate", async ({ candidate }) => {
+      if (!peerConnection || !candidate) return;
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error("Error agregando ICE candidate:", err);
+      }
+    });
+
+    socket.on("stop-sharing", () => {
+      limpiarVideo();
+      setStatus("El emisor detuvo la compartición.");
+    });
+
+    socket.on("peer-left", () => {
+      limpiarVideo();
+      setStatus("El emisor se desconectó.");
+    });
+
+    function crearPeerConnection() {
+      peerConnection = new RTCPeerConnection(ICE_CONFIG);
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit("webrtc-ice-candidate", { candidate: event.candidate });
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
+        videoEl.srcObject = event.streams[0];
+        videoEl.style.display = "block";
+        placeholderEl.style.display = "none";
+        setStatus("Recibiendo transmisión en vivo.", "ok");
+      };
+
+      peerConnection.onconnectionstatechange = () => {
+        console.log("Estado conexión:", peerConnection.connectionState);
+        if (peerConnection.connectionState === "failed") {
+          setStatus(
+            "Conexión fallida. Es posible que se necesite un servidor TURN (ver notas).",
+            "err"
+          );
+        }
+      };
+    }
+
+    function limpiarVideo() {
+      videoEl.srcObject = null;
+      videoEl.style.display = "none";
+      placeholderEl.style.display = "flex";
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+    }
+  </script>
+</body>
+</html>
