@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Emisor - Compartir Pantalla (PoC WebRTC)</title>
+<style>
+  /* ============ ZONA DE INTERFAZ (editable) ============ */
+  /* Si querés cambiar colores, textos o el layout, esta es la parte a tocar. */
+  body {
+    font-family: system-ui, Arial, sans-serif;
+    background: #0f172a;
+    color: #f1f5f9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+    padding: 24px;
+    text-align: center;
+  }
+  h1 {
+    font-size: 1.3rem;
+    margin-bottom: 8px;
+  }
+  p.subtitle {
+    color: #94a3b8;
+    margin-top: 0;
+    margin-bottom: 28px;
+    font-size: 0.95rem;
+  }
+  #shareBtn {
+    background: #2563eb;
+    color: white;
+    border: none;
+    padding: 16px 28px;
+    font-size: 1.05rem;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #shareBtn:disabled {
+    background: #475569;
+    cursor: not-allowed;
+  }
+  #stopBtn {
+    background: #dc2626;
+    color: white;
+    border: none;
+    padding: 12px 24px;
+    font-size: 0.95rem;
+    border-radius: 10px;
+    cursor: pointer;
+    margin-top: 14px;
+    display: none;
+  }
+  #status {
+    margin-top: 22px;
+    font-size: 0.9rem;
+    color: #cbd5e1;
+    min-height: 1.3em;
+  }
+  #status.ok { color: #4ade80; }
+  #status.err { color: #f87171; }
+  .badge {
+    margin-top: 30px;
+    font-size: 0.75rem;
+    color: #64748b;
+  }
+  /* ============ FIN ZONA DE INTERFAZ ============ */
+</style>
+</head>
+<body>
+
+  <h1>📡 Compartir mi pantalla</h1>
+  <p class="subtitle">
+    Al presionar el botón, el navegador te pedirá seleccionar qué pantalla,
+    ventana o pestaña compartir. Esto es un requisito de seguridad del
+    navegador y no se puede omitir.
+  </p>
+
+  <button id="shareBtn">Compartir Pantalla</button>
+  <button id="stopBtn">Detener Compartición</button>
+
+  <div id="status">Esperando acción del usuario...</div>
+
+  <div class="badge">PoC académica — Emisor</div>
+
+  <!-- Cliente de Socket.io servido automáticamente por el backend -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // ============ LÓGICA WEBRTC / SEÑALIZACIÓN (no es interfaz visual) ============
+
+    const shareBtn = document.getElementById("shareBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusEl = document.getElementById("status");
+
+    // Nos conectamos al MISMO servidor que sirvió esta página.
+    // Si este archivo se aloja en Render/Glitch, io() ya apunta a esa URL.
+    const socket = io();
+
+    let localStream = null;
+    let peerConnection = null;
+
+    // Configuración ICE: servidores STUN públicos de Google para
+    // resolver NAT traversal cuando emisor y receptor están en redes distintas.
+    // (Ver sección de notas al final sobre limitaciones de STUN vs TURN).
+    const ICE_CONFIG = {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+    };
+
+    function setStatus(msg, type) {
+      statusEl.textContent = msg;
+      statusEl.className = type || "";
+    }
+
+    socket.on("connect", () => {
+      socket.emit("join", "emisor");
+      setStatus("Conectado al servidor de señalización. Listo para compartir.");
+    });
+
+    socket.on("connect_error", () => {
+      setStatus("No se pudo conectar al servidor de señalización.", "err");
+    });
+
+    // Cuando el receptor se une después que nosotros, le reenviamos
+    // la oferta si ya estábamos compartiendo.
+    socket.on("peer-joined", async ({ role }) => {
+      if (role === "receptor" && peerConnection) {
+        await crearYEnviarOferta();
+      }
+    });
+
+    socket.on("webrtc-answer", async ({ sdp }) => {
+      if (!peerConnection) return;
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+      setStatus("Receptor conectado. Transmitiendo pantalla.", "ok");
+    });
+
+    socket.on("webrtc-ice-candidate", async ({ candidate }) => {
+      if (!peerConnection || !candidate) return;
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error("Error agregando ICE candidate:", err);
+      }
+    });
+
+    // Botón PRINCIPAL: inicia getDisplayMedia() de forma explícita.
+    // El navegador SIEMPRE muestra su propio selector nativo de pantalla/ventana
+    // y, mientras se comparte, un indicador visual que el usuario puede
+    // detener en cualquier momento desde el propio navegador/SO.
+    shareBtn.addEventListener("click", async () => {
+      try {
+        setStatus("Solicitando selección de pantalla...");
+        localStream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: 15 },
+          audio: false,
+        });
+
+        shareBtn.disabled = true;
+        shareBtn.textContent = "Compartiendo...";
+        stopBtn.style.display = "inline-block";
+        setStatus("Pantalla seleccionada. Iniciando conexión WebRTC...");
+
+        // Si el usuario detiene la compartición desde el propio navegador
+        // (botón nativo "Dejar de compartir"), lo detectamos aquí:
+        localStream.getVideoTracks()[0].addEventListener("ended", detenerCompartir);
+
+        crearPeerConnection();
+        localStream.getTracks().forEach((track) => {
+          peerConnection.addTrack(track, localStream);
+        });
+
+        await crearYEnviarOferta();
+      } catch (err) {
+        // El usuario canceló el selector, o el permiso fue denegado.
+        console.error(err);
+        setStatus("Compartición cancelada o no permitida por el usuario.", "err");
+      }
+    });
+
+    stopBtn.addEventListener("click", detenerCompartir);
+
+    function detenerCompartir() {
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+        localStream = null;
+      }
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      socket.emit("stop-sharing");
+      shareBtn.disabled = false;
+      shareBtn.textContent = "Compartir Pantalla";
+      stopBtn.style.display = "none";
+      setStatus("Compartición detenida.");
+    }
+
+    function crearPeerConnection() {
+      peerConnection = new RTCPeerConnection(ICE_CONFIG);
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit("webrtc-ice-candidate", { candidate: event.candidate });
+        }
+      };
+
+      peerConnection.onconnectionstatechange = () => {
+        console.log("Estado conexión:", peerConnection.connectionState);
+        if (peerConnection.connectionState === "failed") {
+          setStatus(
+            "Conexión fallida. Es posible que se necesite un servidor TURN (ver notas).",
+            "err"
+          );
+        }
+      };
+    }
+
+    async function crearYEnviarOferta() {
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.emit("webrtc-offer", { sdp: offer });
+      setStatus("Oferta enviada. Esperando respuesta del receptor...");
+    }
+  </script>
+</body>
+</html>
